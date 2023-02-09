@@ -3056,6 +3056,70 @@ index 650d416ba..c62765dc9 100644
  
    let dependentDialects = [
      "circt::hw::HWDialect"
+diff --git a/include/circt/Dialect/FIRRTL/FIRRTLFieldSource.h b/include/circt/Dialect/FIRRTL/FIRRTLFieldSource.h
+new file mode 100644
+index 000000000..5ef2a501f
+--- /dev/null
++++ b/include/circt/Dialect/FIRRTL/FIRRTLFieldSource.h
+@@ -0,0 +1,58 @@
++//===- FIRRTLFieldSource.h - Field Source (points-to) -----------*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This file defines the FIRRTL Field Source Analysis, which is a points-to
++// analysis which identifies the source field and storage of any value derived
++// from a storage location.  Values derived from reads of storage locations do
++// not appear in this analysis.
++//
++//===----------------------------------------------------------------------===//
++
++#ifndef CIRCT_DIALECT_FIRRTL_FIRRTLFIELDSOURCE_H
++#define CIRCT_DIALECT_FIRRTL_FIRRTLFIELDSOURCE_H
++
++#include "circt/Dialect/FIRRTL/FIRRTLOps.h"
++#include "circt/Support/LLVM.h"
++
++namespace circt {
++namespace firrtl {
++
++/// To use this class, retrieve a cached copy from the analysis manager:
++///   auto &fieldsource = getAnalysis<FieldSource>(getOperation());
++class FieldSource {
++
++public:
++  explicit FieldSource(Operation *operation);
++
++  struct PathNode {
++    PathNode(Value src, ArrayRef<int64_t> ar) : src(src), path(ar) {}
++    Value src;
++    SmallVector<int64_t, 4> path;
++
++    bool isRoot() const { return path.empty(); }
++  };
++
++  const PathNode *nodeForValue(Value v) const;
++
++private:
++  void visitOp(Operation *op);
++  void visitSubfield(SubfieldOp sf);
++  void visitSubindex(SubindexOp si);
++  void visitSubaccess(SubaccessOp sa);
++  void visitMem(MemOp mem);
++  void visitInst(InstanceOp inst);
++
++  void makeNodeForValue(Value dst, Value src, ArrayRef<int64_t> path);
++
++  DenseMap<Value, PathNode> paths;
++};
++
++} // namespace firrtl
++} // namespace circt
++
++#endif // CIRCT_DIALECT_FIRRTL_FIRRTLFIELDSOURCE_H
 diff --git a/include/circt/Dialect/FIRRTL/FIRRTLOpInterfaces.td b/include/circt/Dialect/FIRRTL/FIRRTLOpInterfaces.td
 index 8f0a521b9..5401e8021 100644
 --- a/include/circt/Dialect/FIRRTL/FIRRTLOpInterfaces.td
@@ -3184,6 +3248,36 @@ index 2e21bf610..cb4b547e6 100644
    let builders = [
      OpBuilder<(ins "StringAttr":$name, "ArrayRef<PortInfo>":$ports,
                 CArg<"ArrayAttr","ArrayAttr()">:$annotations)>
+diff --git a/include/circt/Dialect/FIRRTL/Passes.h b/include/circt/Dialect/FIRRTL/Passes.h
+index f061099aa..39c37af37 100644
+--- a/include/circt/Dialect/FIRRTL/Passes.h
++++ b/include/circt/Dialect/FIRRTL/Passes.h
+@@ -96,6 +96,8 @@ createMemToRegOfVecPass(bool replSeqMem = false, bool ignoreReadEnable = false);
+ 
+ std::unique_ptr<mlir::Pass> createPrefixModulesPass();
+ 
++std::unique_ptr<mlir::Pass> createFIRRTLFieldSourcePass();
++
+ std::unique_ptr<mlir::Pass> createPrintInstanceGraphPass();
+ 
+ std::unique_ptr<mlir::Pass> createPrintNLATablePass();
+diff --git a/include/circt/Dialect/FIRRTL/Passes.td b/include/circt/Dialect/FIRRTL/Passes.td
+index 495599dcc..a164496f4 100644
+--- a/include/circt/Dialect/FIRRTL/Passes.td
++++ b/include/circt/Dialect/FIRRTL/Passes.td
+@@ -402,6 +402,12 @@ def PrefixModules : Pass<"firrtl-prefix-modules", "firrtl::CircuitOp"> {
+   let constructor = "circt::firrtl::createPrefixModulesPass()";
+ }
+ 
++def PrintFIRRTLFieldSourcePass
++    : Pass<"firrtl-print-field-source", "firrtl::FModuleOp"> {
++  let summary = "Print field source information.";
++  let constructor =  "circt::firrtl::createFIRRTLFieldSourcePass()";
++}
++
+ def PrintInstanceGraph
+     : Pass<"firrtl-print-instance-graph", "firrtl::CircuitOp"> {
+   let summary = "Print a DOT graph of the module hierarchy.";
 diff --git a/include/circt/Dialect/FSM/FSM.td b/include/circt/Dialect/FSM/FSM.td
 index f288fa4bb..de3a70891 100644
 --- a/include/circt/Dialect/FSM/FSM.td
@@ -5384,6 +5478,18 @@ index c1043c6a4..08c27fe57 100644
  }
  
  void SeqMemOp::getAsmResultNames(OpAsmSetValueNameFn setNameFn) {
+diff --git a/lib/Dialect/FIRRTL/CMakeLists.txt b/lib/Dialect/FIRRTL/CMakeLists.txt
+index 443e97b47..296e0dbc5 100644
+--- a/lib/Dialect/FIRRTL/CMakeLists.txt
++++ b/lib/Dialect/FIRRTL/CMakeLists.txt
+@@ -5,6 +5,7 @@ add_circt_dialect_library(CIRCTFIRRTL
+   FIRRTLAnnotations.cpp
+   FIRRTLAttributes.cpp
+   FIRRTLDialect.cpp
++  FIRRTLFieldSource.cpp
+   FIRRTLFolds.cpp
+   FIRRTLInstanceGraph.cpp
+   FIRRTLOpInterfaces.cpp
 diff --git a/lib/Dialect/FIRRTL/FIRRTLAnnotationHelper.cpp b/lib/Dialect/FIRRTL/FIRRTLAnnotationHelper.cpp
 index ebcd5d86e..21c7101a5 100644
 --- a/lib/Dialect/FIRRTL/FIRRTLAnnotationHelper.cpp
@@ -5587,8 +5693,110 @@ index ebcd5d86e..21c7101a5 100644
 +      {sendVal, sink, "memTap", WiringProblem::RefTypeUsage::Prefer});
    return success();
  }
+diff --git a/lib/Dialect/FIRRTL/FIRRTLFieldSource.cpp b/lib/Dialect/FIRRTL/FIRRTLFieldSource.cpp
+new file mode 100644
+index 000000000..7fc0893ab
+--- /dev/null
++++ b/lib/Dialect/FIRRTL/FIRRTLFieldSource.cpp
+@@ -0,0 +1,96 @@
++//===- FIRRTLFieldSource.cpp - Field Source Analysis ------------*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This file defines a basic points-to like analysis.
++//
++//===----------------------------------------------------------------------===//
++
++#include "circt/Dialect/FIRRTL/FIRRTLFieldSource.h"
++
++using namespace circt;
++using namespace firrtl;
++
++FieldSource::FieldSource(Operation *operation) {
++  FModuleOp mod = cast<FModuleOp>(operation);
++  for (auto port : mod.getBodyBlock()->getArguments())
++    if (auto ft = dyn_cast<FIRRTLBaseType>(port.getType()))
++      if (!ft.isGround())
++        makeNodeForValue(port, port, {});
++  for (auto &op : *mod.getBodyBlock())
++    visitOp(&op);
++}
++
++void FieldSource::visitOp(Operation *op) {
++  if (auto sf = dyn_cast<SubfieldOp>(op))
++    return visitSubfield(sf);
++  if (auto si = dyn_cast<SubindexOp>(op))
++    return visitSubindex(si);
++  if (auto sa = dyn_cast<SubaccessOp>(op))
++    return visitSubaccess(sa);
++  if (isa<WireOp, NodeOp, RegOp, RegResetOp, BitCastOp>(op))
++    return makeNodeForValue(op->getResult(0), op->getResult(0), {});
++  if (auto mem = dyn_cast<MemOp>(op))
++    return visitMem(mem);
++  if (auto inst = dyn_cast<InstanceOp>(op))
++    return visitInst(inst);
++  // recurse in to regions
++  for (auto &r : op->getRegions())
++    for (auto &b : r.getBlocks())
++      for (auto &op : b)
++        visitOp(&op);
++}
++
++void FieldSource::visitSubfield(SubfieldOp sf) {
++  auto value = sf.getInput();
++  const auto *node = nodeForValue(value);
++  assert(node && "node should be in the map");
++  auto sv = node->path;
++  sv.push_back(sf.getFieldIndex());
++  makeNodeForValue(sf.getResult(), node->src, sv);
++}
++
++void FieldSource::visitSubindex(SubindexOp si) {
++  auto value = si.getInput();
++  const auto *node = nodeForValue(value);
++  assert(node && "node should be in the map");
++  auto sv = node->path;
++  sv.push_back(si.getIndex());
++  makeNodeForValue(si.getResult(), node->src, sv);
++}
++
++void FieldSource::visitSubaccess(SubaccessOp sa) {
++  auto value = sa.getInput();
++  const auto *node = nodeForValue(value);
++  assert(node && "node should be in the map");
++  auto sv = node->path;
++  sv.push_back(-1);
++  makeNodeForValue(sa.getResult(), node->src, sv);
++}
++
++void FieldSource::visitMem(MemOp mem) {
++  for (auto r : mem.getResults())
++    makeNodeForValue(r, r, {});
++}
++
++void FieldSource::visitInst(InstanceOp inst) {
++  for (auto r : inst.getResults())
++    makeNodeForValue(r, r, {});
++}
++
++const FieldSource::PathNode *FieldSource::nodeForValue(Value v) const {
++  auto ii = paths.find(v);
++  if (ii == paths.end())
++    return nullptr;
++  return &ii->second;
++}
++
++void FieldSource::makeNodeForValue(Value dst, Value src,
++                                   ArrayRef<int64_t> path) {
++  auto ii = paths.try_emplace(dst, src, path);
++  assert(ii.second && "Double insert into the map");
++}
 diff --git a/lib/Dialect/FIRRTL/FIRRTLFolds.cpp b/lib/Dialect/FIRRTL/FIRRTLFolds.cpp
-index 9d388f575..02e9ddd42 100644
+index 9d388f575..6059dffce 100644
 --- a/lib/Dialect/FIRRTL/FIRRTLFolds.cpp
 +++ b/lib/Dialect/FIRRTL/FIRRTLFolds.cpp
 @@ -194,10 +194,9 @@ enum class BinOpKind {
@@ -6415,6 +6623,15 @@ index 9d388f575..02e9ddd42 100644
      auto index = constIndex->getZExtValue();
      if (index >= 0 && index < getInputs().size())
        return getInputs()[getInputs().size() - 1 - index];
+@@ -1527,7 +1542,7 @@ static LogicalResult canonicalizeSingleSetConnect(StrictConnectOp op,
+   if (getSingleConnectUserOf(op.getDest()) != op)
+     return failure();
+ 
+-  // Only foward if there is more than one use
++  // Only forward if there is more than one use
+   if (connectedDecl->hasOneUse())
+     return failure();
+ 
 @@ -1705,14 +1720,14 @@ struct NodeBypass : public mlir::RewritePattern {
  } // namespace
  
@@ -7052,8 +7269,32 @@ index 1052e16ef..8114a65ef 100644
  
    UnbundledValueEntry unbundledValueEntry;
    unbundledValueEntry.reserve(result.getNumResults());
+diff --git a/lib/Dialect/FIRRTL/Transforms/AddSeqMemPorts.cpp b/lib/Dialect/FIRRTL/Transforms/AddSeqMemPorts.cpp
+index 84d3ad2ba..362bbd05a 100644
+--- a/lib/Dialect/FIRRTL/Transforms/AddSeqMemPorts.cpp
++++ b/lib/Dialect/FIRRTL/Transforms/AddSeqMemPorts.cpp
+@@ -194,13 +194,15 @@ LogicalResult AddSeqMemPortsPass::processModule(FModuleOp module, bool isDUT) {
+   for (auto &op : llvm::make_early_inc_range(*module.getBodyBlock())) {
+     if (auto inst = dyn_cast<InstanceOp>(op)) {
+       auto submodule = instanceGraph->getReferencedModule(inst);
+-      auto &subMemInfo = memInfoMap[submodule];
+-      // Find out how many memory ports we have to add.
+-      auto &subExtraPorts = subMemInfo.extraPorts;
+ 
++      auto subMemInfoIt = memInfoMap.find(submodule);
+       // If there are no extra ports, we don't have to do anything.
+-      if (subExtraPorts.size() == 0)
++      if (subMemInfoIt == memInfoMap.end() ||
++          subMemInfoIt->second.extraPorts.empty())
+         continue;
++      auto &subMemInfo = subMemInfoIt->second;
++      // Find out how many memory ports we have to add.
++      auto &subExtraPorts = subMemInfo.extraPorts;
+ 
+       // Add the extra ports to the instance operation.
+       auto clone = inst.cloneAndInsertPorts(subExtraPorts);
 diff --git a/lib/Dialect/FIRRTL/Transforms/CMakeLists.txt b/lib/Dialect/FIRRTL/Transforms/CMakeLists.txt
-index 57d42002c..1404a0ab9 100755
+index 57d42002c..2762e3f2e 100755
 --- a/lib/Dialect/FIRRTL/Transforms/CMakeLists.txt
 +++ b/lib/Dialect/FIRRTL/Transforms/CMakeLists.txt
 @@ -18,6 +18,7 @@ add_circt_dialect_library(CIRCTFIRRTLTransforms
@@ -7064,6 +7305,14 @@ index 57d42002c..1404a0ab9 100755
    LowerAnnotations.cpp
    LowerCHIRRTL.cpp
    LowerIntrinsics.cpp
+@@ -28,6 +29,7 @@ add_circt_dialect_library(CIRCTFIRRTLTransforms
+   MemToRegOfVec.cpp
+   ModuleInliner.cpp
+   PrefixModules.cpp
++  PrintFIRRTLFieldSource.cpp
+   PrintInstanceGraph.cpp
+   PrintNLATable.cpp
+   RandomizeRegisterInit.cpp
 diff --git a/lib/Dialect/FIRRTL/Transforms/Dedup.cpp b/lib/Dialect/FIRRTL/Transforms/Dedup.cpp
 index 0ff7563c4..b0070074a 100644
 --- a/lib/Dialect/FIRRTL/Transforms/Dedup.cpp
@@ -7368,7 +7617,7 @@ index 000000000..ca6e7886e
 +  return success();
 +}
 diff --git a/lib/Dialect/FIRRTL/Transforms/LowerAnnotations.cpp b/lib/Dialect/FIRRTL/Transforms/LowerAnnotations.cpp
-index 6b15c7d9d..1166435c5 100644
+index 6b15c7d9d..4fc9307c3 100644
 --- a/lib/Dialect/FIRRTL/Transforms/LowerAnnotations.cpp
 +++ b/lib/Dialect/FIRRTL/Transforms/LowerAnnotations.cpp
 @@ -277,6 +277,62 @@ static LogicalResult drop(const AnnoPathValue &target, DictionaryAttr anno,
@@ -7434,7 +7683,16 @@ index 6b15c7d9d..1166435c5 100644
  //===----------------------------------------------------------------------===//
  // Driving table
  //===----------------------------------------------------------------------===//
-@@ -400,6 +456,11 @@ static const llvm::StringMap<AnnoRecord> annotationRecords{{
+@@ -366,6 +422,8 @@ static const llvm::StringMap<AnnoRecord> annotationRecords{{
+      {stdResolve, applyWithoutTarget<false, FModuleOp, FExtModuleOp>}},
+     {blackBoxInlineAnnoClass,
+      {stdResolve, applyWithoutTarget<false, FExtModuleOp>}},
++    {blackBoxPathAnnoClass,
++     {stdResolve, applyWithoutTarget<false, FExtModuleOp>}},
+     {dontObfuscateModuleAnnoClass,
+      {stdResolve, applyWithoutTarget<false, FModuleOp>}},
+     {verifBlackBoxAnnoClass,
+@@ -400,6 +458,11 @@ static const llvm::StringMap<AnnoRecord> annotationRecords{{
      {blackBoxTargetDirAnnoClass, NoTargetAnnotation},
      {traceNameAnnoClass, {stdResolve, applyTraceName}},
      {traceAnnoClass, {stdResolve, applyWithoutTarget<true>}},
@@ -7446,7 +7704,7 @@ index 6b15c7d9d..1166435c5 100644
  
  }};
  
-@@ -428,6 +489,7 @@ struct LowerAnnotationsPass
+@@ -428,6 +491,7 @@ struct LowerAnnotationsPass
      : public LowerFIRRTLAnnotationsBase<LowerAnnotationsPass> {
    void runOnOperation() override;
    LogicalResult applyAnnotation(DictionaryAttr anno, ApplyState &state);
@@ -7454,7 +7712,7 @@ index 6b15c7d9d..1166435c5 100644
    LogicalResult solveWiringProblems(ApplyState &state);
  
    bool ignoreUnhandledAnno = false;
-@@ -475,12 +537,33 @@ LogicalResult LowerAnnotationsPass::applyAnnotation(DictionaryAttr anno,
+@@ -475,12 +539,33 @@ LogicalResult LowerAnnotationsPass::applyAnnotation(DictionaryAttr anno,
    return success();
  }
  
@@ -7493,7 +7751,7 @@ index 6b15c7d9d..1166435c5 100644
  LogicalResult LowerAnnotationsPass::solveWiringProblems(ApplyState &state) {
    // Utility function to extract the defining module from a value which may be
    // either a BlockArgument or an Operation result.
-@@ -690,12 +773,33 @@ LogicalResult LowerAnnotationsPass::solveWiringProblems(ApplyState &state) {
+@@ -690,12 +775,33 @@ LogicalResult LowerAnnotationsPass::solveWiringProblems(ApplyState &state) {
      moduleModifications[sourceModule].connectionMap[index] = source;
      moduleModifications[sinkModule].connectionMap[index] = sink;
  
@@ -7533,7 +7791,7 @@ index 6b15c7d9d..1166435c5 100644
  
      // Record module modifications related to adding ports to modules.
      auto addPorts = [&](ArrayRef<hw::HWInstanceLike> insts, Value val, Type tpe,
-@@ -722,11 +826,8 @@ LogicalResult LowerAnnotationsPass::solveWiringProblems(ApplyState &state) {
+@@ -722,11 +828,8 @@ LogicalResult LowerAnnotationsPass::solveWiringProblems(ApplyState &state) {
      };
  
      // Record the addition of ports.
@@ -7547,7 +7805,7 @@ index 6b15c7d9d..1166435c5 100644
    }
  
    // Iterate over modules from leaves to roots, applying ModuleModifications to
-@@ -861,6 +962,9 @@ void LowerAnnotationsPass::runOnOperation() {
+@@ -861,6 +964,9 @@ void LowerAnnotationsPass::runOnOperation() {
        ++numFailures;
    }
  
@@ -7698,6 +7956,77 @@ index bb557f059..57be707b2 100644
          for (const auto &res : llvm::enumerate(oldResults))
            res.value().replaceAllUsesWith(newMem.getResult(res.index()));
          mem.erase();
+diff --git a/lib/Dialect/FIRRTL/Transforms/PrintFIRRTLFieldSource.cpp b/lib/Dialect/FIRRTL/Transforms/PrintFIRRTLFieldSource.cpp
+new file mode 100644
+index 000000000..31fae52bb
+--- /dev/null
++++ b/lib/Dialect/FIRRTL/Transforms/PrintFIRRTLFieldSource.cpp
+@@ -0,0 +1,65 @@
++//===- PrintFIRRTLFieldSource.cpp - Print the Field Source ------*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//===----------------------------------------------------------------------===//
++//
++// Print the FieldSource analysis.
++//
++//===----------------------------------------------------------------------===//
++
++#include "PassDetails.h"
++#include "circt/Dialect/FIRRTL/FIRRTLFieldSource.h"
++#include "circt/Dialect/FIRRTL/Passes.h"
++#include "llvm/Support/raw_ostream.h"
++
++using namespace circt;
++using namespace firrtl;
++
++namespace {
++struct PrintFIRRTLFieldSourcePass
++    : public PrintFIRRTLFieldSourcePassBase<PrintFIRRTLFieldSourcePass> {
++  PrintFIRRTLFieldSourcePass(raw_ostream &os) : os(os) {}
++
++  void visitValue(const FieldSource &fieldRefs, Value v) {
++    auto *p = fieldRefs.nodeForValue(v);
++    if (p) {
++      if (p->isRoot())
++        os << "ROOT: ";
++      else
++        os << "SUB:  " << v;
++      os << " : " << p->src << " : {";
++      llvm::interleaveComma(p->path, os);
++      os << "}\n";
++    }
++  }
++
++  void visitOp(const FieldSource &fieldRefs, Operation *op) {
++    for (auto r : op->getResults())
++      visitValue(fieldRefs, r);
++    // recurse in to regions
++    for (auto &r : op->getRegions())
++      for (auto &b : r.getBlocks())
++        for (auto &op : b)
++          visitOp(fieldRefs, &op);
++  }
++
++  void runOnOperation() override {
++    auto modOp = getOperation();
++    os << "** " << modOp.getName() << "\n";
++    auto &fieldRefs = getAnalysis<FieldSource>();
++    for (auto port : modOp.getBodyBlock()->getArguments())
++      visitValue(fieldRefs, port);
++    for (auto &op : *modOp.getBodyBlock())
++      visitOp(fieldRefs, &op);
++
++    markAllAnalysesPreserved();
++  }
++  raw_ostream &os;
++};
++} // end anonymous namespace
++
++std::unique_ptr<mlir::Pass> circt::firrtl::createFIRRTLFieldSourcePass() {
++  return std::make_unique<PrintFIRRTLFieldSourcePass>(llvm::errs());
++}
 diff --git a/lib/Dialect/HW/HWOps.cpp b/lib/Dialect/HW/HWOps.cpp
 index 339eb3bf2..55602a819 100644
 --- a/lib/Dialect/HW/HWOps.cpp
@@ -9579,6 +9908,65 @@ index 53b9f55b0..e6a73c664 100644
  
    // Keeps track if anything changed during this pass, used to determine if
    // the analyses were preserved.
+diff --git a/lib/Dialect/SV/Transforms/SVExtractTestCode.cpp b/lib/Dialect/SV/Transforms/SVExtractTestCode.cpp
+index 8cee7cc39..889f99407 100644
+--- a/lib/Dialect/SV/Transforms/SVExtractTestCode.cpp
++++ b/lib/Dialect/SV/Transforms/SVExtractTestCode.cpp
+@@ -232,16 +232,34 @@ static void addInstancesToCloneSet(
+     inputs.insert(v);
+ }
+ 
+-static StringRef getNameForPort(Value val, ArrayAttr modulePorts) {
+-  if (auto readinout = dyn_cast_or_null<ReadInOutOp>(val.getDefiningOp())) {
+-    if (auto wire = dyn_cast<WireOp>(readinout.getInput().getDefiningOp()))
+-      return wire.getName();
+-    if (auto reg = dyn_cast<RegOp>(readinout.getInput().getDefiningOp()))
+-      return reg.getName();
+-  } else if (auto bv = val.dyn_cast<BlockArgument>()) {
+-    return modulePorts[bv.getArgNumber()].cast<StringAttr>().getValue();
++static StringAttr getNameForPort(Value val, ArrayAttr modulePorts) {
++  if (auto bv = val.dyn_cast<BlockArgument>())
++    return modulePorts[bv.getArgNumber()].cast<StringAttr>();
++
++  if (auto *op = val.getDefiningOp()) {
++    if (auto readinout = dyn_cast<ReadInOutOp>(op)) {
++      if (auto *readOp = readinout.getInput().getDefiningOp()) {
++        if (auto wire = dyn_cast<WireOp>(readOp))
++          return wire.getNameAttr();
++        if (auto reg = dyn_cast<RegOp>(readOp))
++          return reg.getNameAttr();
++      }
++    } else if (auto inst = dyn_cast<hw::InstanceOp>(op)) {
++      for (auto [index, result] : llvm::enumerate(inst.getResults()))
++        if (result == val) {
++          SmallString<64> portName = inst.getInstanceName();
++          portName += ".";
++          auto resultName = inst.getResultName(index);
++          if (resultName && !resultName.getValue().empty())
++            portName += resultName.getValue();
++          else
++            Twine(index).toVector(portName);
++          return StringAttr::get(val.getContext(), portName);
++        }
++    }
+   }
+-  return "";
++
++  return StringAttr::get(val.getContext(), "");
+ }
+ 
+ // Given a set of values, construct a module and bind instance of that module
+@@ -279,8 +297,8 @@ static hw::HWModuleOp createModuleForCut(hw::HWModuleOp op,
+     auto srcPorts = op.getArgNames();
+     for (auto &port : llvm::enumerate(realInputs)) {
+       auto name = getNameForPort(port.value(), srcPorts);
+-      ports.push_back({b.getStringAttr(name), hw::PortDirection::INPUT,
+-                       port.value().getType(), port.index()});
++      ports.push_back({name, hw::PortDirection::INPUT, port.value().getType(),
++                       port.index()});
+     }
+   }
+ 
 diff --git a/lib/Dialect/Seq/SeqOps.cpp b/lib/Dialect/Seq/SeqOps.cpp
 index b3dcecd19..77365cb00 100644
 --- a/lib/Dialect/Seq/SeqOps.cpp
@@ -11404,6 +11792,40 @@ index 879d0eeb0..f55cb055d 100644
    }
  
    // CHECK-NEXT: hw.output
+diff --git a/test/Dialect/SV/hw-extract-test-code.mlir b/test/Dialect/SV/hw-extract-test-code.mlir
+index c13d29384..f49abb8dc 100644
+--- a/test/Dialect/SV/hw-extract-test-code.mlir
++++ b/test/Dialect/SV/hw-extract-test-code.mlir
+@@ -133,6 +133,29 @@ module attributes {firrtl.extract.assert =  #hw.output_file<"dir3/", excludeFrom
+   }
+ }
+ 
++// -----
++// Check extracted module ports take name of instance result when needed.
++
++// CHECK-LABEL: @InstResult(
++// CHECK: hw.instance "[[name:.+]]_cover"  sym @{{[^ ]+}} @[[name]]_cover(mem.result_name: %{{[^ ]+}}: i1, mem.1: %{{[^ ]+}}: i1, clock: %clock: i1)
++module attributes {firrtl.extract.assert =  #hw.output_file<"dir3/", excludeFromFileList, includeReplicatedOps>} {
++  hw.module @Mem() -> (result_name: i1, "": i1) {
++    %reg = sv.reg : !hw.inout<i1>
++    %0 = sv.read_inout %reg : !hw.inout<i1>
++    hw.output %0, %0 : i1, i1
++  }
++  // Dummy is needed to prevent the instance itself being extracted
++  hw.module @Dummy(%in1: i1, %in2: i1) -> () {}
++  hw.module @InstResult(%clock: i1) -> () {
++    %0, %1 = hw.instance "mem" @Mem() -> (result_name: i1, "": i1)
++    hw.instance "dummy" sym @keep @Dummy(in1: %0 : i1, in2: %1 : i1) -> ()
++    %2 = comb.and bin %0, %1 : i1
++    sv.always posedge %clock  {
++      sv.cover %2, immediate
++    }
++  }
++}
++
+ // -----
+ // Check "empty" modules are inlined
+ 
 diff --git a/test/Dialect/SV/hw-legalize-modules-packed-arrays.mlir b/test/Dialect/SV/hw-legalize-modules-packed-arrays.mlir
 index b1030bb25..682d2c702 100644
 --- a/test/Dialect/SV/hw-legalize-modules-packed-arrays.mlir
@@ -11646,6 +12068,25 @@ index d656b5268..f4e6478a2 100644
  ; VERILOG:         always @(posedge clock)
  ; VERILOG-NEXT:      r <= a_d;
  ; VERILOG:         assign a_q = r;
+diff --git a/test/firtool/include-dirs.fir b/test/firtool/include-dirs.fir
+index 5545d36f2..6549870fb 100644
+--- a/test/firtool/include-dirs.fir
++++ b/test/firtool/include-dirs.fir
+@@ -18,6 +18,14 @@
+ ; RUN: not firtool %s -I %t/alt -I %t 2>&1 | FileCheck %s --check-prefixes=COMMON,ALTERNATE
+ ; RUN: not firtool %s -I %t -I %t/alt 2>&1 | FileCheck %s --check-prefixes=COMMON,FOUND
+ 
++; Include paths are extra, searched after normal resolution (matters for relative paths).
++; Expect this to resolve to %t/subdir/source.dummy.
++; RUN: cd %t && not firtool %s -Ialt 2>&1 | FileCheck %s --check-prefixes=COMMON,FOUND
++
++; Check relative path (look in '../alt' from 'subdir').
++; RUN: cd %t/subdir && not firtool %s -I../alt 2>&1 | FileCheck %s --check-prefixes=COMMON,ALTERNATE
++
++
+ ; COMMON: subdir/source.dummy:2:3:
+ ; MISSING-NOT: alternate
+ ; MISSING-NOT: generate
 diff --git a/test/firtool/print-before.fir b/test/firtool/print-before.fir
 index cd630fbbe..bca270456 100644
 --- a/test/firtool/print-before.fir
