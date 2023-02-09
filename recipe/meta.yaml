@@ -1,5 +1,5 @@
 {% set name = "firtool" %}
-{% set version = "1.29.0" %}
+{% set version = "1.29.0-newhammer-hotfix" %}
 {% set tag = "firtool-1.29.0" %}
 {% set build_number = environ.get('GIT_DESCRIBE_NUMBER', '0') %}
 
