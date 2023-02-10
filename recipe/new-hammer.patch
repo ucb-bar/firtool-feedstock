@@ -1,0 +1,330 @@
+diff --git a/lib/Conversion/ExportVerilog/ExportVerilog.cpp b/lib/Conversion/ExportVerilog/ExportVerilog.cpp
+index 1569d2a95..bbf872b96 100644
+--- a/lib/Conversion/ExportVerilog/ExportVerilog.cpp
++++ b/lib/Conversion/ExportVerilog/ExportVerilog.cpp
+@@ -581,7 +581,8 @@ static bool isOkToBitSelectFrom(Value v) {
+ /// happens because not all Verilog expressions are composable, notably you
+ /// can only use bit selects like x[4:6] on simple expressions, you cannot use
+ /// expressions in the sensitivity list of always blocks, etc.
+-static bool isExpressionUnableToInline(Operation *op) {
++static bool isExpressionUnableToInline(Operation *op,
++                                       const LoweringOptions &options) {
+   if (auto cast = dyn_cast<BitcastOp>(op))
+     if (!haveMatchingDims(cast.getInput().getType(), cast.getResult().getType(),
+                           op->getLoc())) {
+@@ -625,7 +626,7 @@ static bool isExpressionUnableToInline(Operation *op) {
+         return true;
+ 
+     // Always blocks must have a name in their sensitivity list, not an expr.
+-    if (isa<AlwaysOp>(user) || isa<AlwaysFFOp>(user)) {
++    if (!options.allowExprInEventControl && isa<AlwaysOp, AlwaysFFOp>(user)) {
+       // Anything other than a read of a wire must be out of line.
+       if (auto read = dyn_cast<ReadInOutOp>(op))
+         if (read.getInput().getDefiningOp<WireOp>() ||
+@@ -711,7 +712,7 @@ bool ExportVerilog::isExpressionEmittedInline(Operation *op,
+ 
+   // If it isn't structurally possible to inline this expression, emit it out
+   // of line.
+-  return !isExpressionUnableToInline(op);
++  return !isExpressionUnableToInline(op, options);
+ }
+ 
+ /// Find a nested IfOp in an else block that can be printed as `else if`
+diff --git a/lib/Conversion/ExportVerilog/PrepareForEmission.cpp b/lib/Conversion/ExportVerilog/PrepareForEmission.cpp
+index fb7669259..940ff4adb 100644
+--- a/lib/Conversion/ExportVerilog/PrepareForEmission.cpp
++++ b/lib/Conversion/ExportVerilog/PrepareForEmission.cpp
+@@ -723,42 +723,6 @@ static LogicalResult legalizeHWModule(Block &block,
+       }
+     }
+ 
+-    // Force any expression used in the event control of an always process to be
+-    // a trivial wire, if the corresponding option is set.
+-    if (!options.allowExprInEventControl) {
+-      auto enforceWire = [&](Value expr) {
+-        // Direct port uses are fine.
+-        if (isSimpleReadOrPort(expr))
+-          return;
+-        if (auto inst = expr.getDefiningOp<InstanceOp>())
+-          return;
+-        auto builder = ImplicitLocOpBuilder::atBlockBegin(
+-            op.getLoc(), &op.getParentOfType<HWModuleOp>().front());
+-        auto newWire = builder.create<WireOp>(expr.getType());
+-        builder.setInsertionPoint(&op);
+-        auto newWireRead = builder.create<ReadInOutOp>(newWire);
+-        // For simplicity, replace all uses with the read first.  This lets us
+-        // recursive root out all uses of the expression.
+-        expr.replaceAllUsesWith(newWireRead);
+-        builder.setInsertionPoint(&op);
+-        builder.create<AssignOp>(newWire, expr);
+-        // To get the output correct, given that reads are always inline,
+-        // duplicate them for each use.
+-        lowerAlwaysInlineOperation(newWireRead);
+-      };
+-      if (auto always = dyn_cast<AlwaysOp>(op)) {
+-        for (auto clock : always.getClocks())
+-          enforceWire(clock);
+-        continue;
+-      }
+-      if (auto always = dyn_cast<AlwaysFFOp>(op)) {
+-        enforceWire(always.getClock());
+-        if (auto reset = always.getReset())
+-          enforceWire(reset);
+-        continue;
+-      }
+-    }
+-
+     // If the target doesn't support local variables, hoist all the expressions
+     // out to the nearest non-procedural region.
+     if (options.disallowLocalVariables && isVerilogExpression(&op) &&
+diff --git a/lib/Dialect/SV/Transforms/HWLegalizeModules.cpp b/lib/Dialect/SV/Transforms/HWLegalizeModules.cpp
+index 79784d026..025d86625 100644
+--- a/lib/Dialect/SV/Transforms/HWLegalizeModules.cpp
++++ b/lib/Dialect/SV/Transforms/HWLegalizeModules.cpp
+@@ -56,33 +56,46 @@ private:
+ /// This returns a replacement operation if lowering was successful, null
+ /// otherwise.
+ Operation *HWLegalizeModulesPass::tryLoweringArrayGet(hw::ArrayGetOp getOp) {
+-  // If the operand is an array_create, then we can lower this into a casez.
+-  auto createOp = getOp.getInput().getDefiningOp<hw::ArrayCreateOp>();
+-  if (!createOp)
++  SmallVector<Value> caseValues;
++  OpBuilder builder(&thisHWModule.getBodyBlock()->front());
++  // If the operand is an array_create or aggregate constant, then we can lower
++  // this into a casez.
++  if (auto createOp = getOp.getInput().getDefiningOp<hw::ArrayCreateOp>())
++    caseValues = SmallVector<Value>(llvm::reverse(createOp.getOperands()));
++  else if (auto aggregateConstant =
++               getOp.getInput().getDefiningOp<hw::AggregateConstantOp>()) {
++    for (auto elem : llvm::reverse(aggregateConstant.getFields())) {
++      if (auto intAttr = dyn_cast<IntegerAttr>(elem))
++        caseValues.push_back(builder.create<hw::ConstantOp>(
++            aggregateConstant.getLoc(), intAttr));
++      else
++        caseValues.push_back(builder.create<hw::AggregateConstantOp>(
++            aggregateConstant.getLoc(), getOp.getType(),
++            elem.cast<ArrayAttr>()));
++    }
++  } else {
+     return nullptr;
++  }
+ 
+   // array_get(idx, array_create(a,b,c,d)) ==> casez(idx).
+   Value index = getOp.getIndex();
+ 
+   // Create the wire for the result of the casez in the hw.module.
+-  OpBuilder builder(&thisHWModule.getBodyBlock()->front());
+-
+   auto theWire = builder.create<sv::RegOp>(getOp.getLoc(), getOp.getType(),
+                                            builder.getStringAttr("casez_tmp"));
+   builder.setInsertionPoint(getOp);
+ 
++  auto loc = getOp.getInput().getDefiningOp()->getLoc();
+   // A casez is a procedural operation, so if we're in a non-procedural region
+   // we need to inject an always_comb block.
+   if (!getOp->getParentOp()->hasTrait<sv::ProceduralRegion>()) {
+-    auto alwaysComb = builder.create<sv::AlwaysCombOp>(createOp.getLoc());
++    auto alwaysComb = builder.create<sv::AlwaysCombOp>(loc);
+     builder.setInsertionPointToEnd(alwaysComb.getBodyBlock());
+   }
+ 
+   // If we are missing elements in the array (it is non-power of two), then
+   // add a default 'X' value.
+-  SmallVector<Value> caseValues(llvm::reverse(createOp.getOperands()));
+-  if (1ULL << index.getType().getIntOrFloatBitWidth() !=
+-      createOp.getNumOperands()) {
++  if (1ULL << index.getType().getIntOrFloatBitWidth() != caseValues.size()) {
+     caseValues.push_back(
+         builder.create<sv::ConstantXOp>(getOp.getLoc(), getOp.getType()));
+   }
+@@ -92,7 +105,7 @@ Operation *HWLegalizeModulesPass::tryLoweringArrayGet(hw::ArrayGetOp getOp) {
+ 
+   // Create the casez itself.
+   builder.create<sv::CaseOp>(
+-      createOp.getLoc(), CaseStmtType::CaseZStmt, index, caseValues.size(),
++      loc, CaseStmtType::CaseZStmt, index, caseValues.size(),
+       [&](size_t caseIdx) -> std::unique_ptr<sv::CasePattern> {
+         // Use a default pattern for the last value, even if we are complete.
+         // This avoids tools thinking they need to insert a latch due to
+@@ -106,7 +119,7 @@ Operation *HWLegalizeModulesPass::tryLoweringArrayGet(hw::ArrayGetOp getOp) {
+         else
+           thePattern = std::make_unique<sv::CaseBitPattern>(caseValue, context);
+         ++caseValue;
+-        builder.create<sv::BPAssignOp>(createOp.getLoc(), theWire, theValue);
++        builder.create<sv::BPAssignOp>(loc, theWire, theValue);
+         return thePattern;
+       });
+ 
+@@ -149,9 +162,10 @@ void HWLegalizeModulesPass::processPostOrder(Block &body) {
+           continue;
+         }
+ 
+-      // If this is a dead array_create, then we can just delete it.  This is
++      // If this is a dead array, then we can just delete it.  This is
+       // probably left over from get/create lowering.
+-      if (isa<hw::ArrayCreateOp>(op) && op.use_empty()) {
++      if (isa<hw::ArrayCreateOp, hw::AggregateConstantOp>(op) &&
++          op.use_empty()) {
+         op.erase();
+         continue;
+       }
+@@ -163,6 +177,7 @@ void HWLegalizeModulesPass::processPostOrder(Block &body) {
+       for (auto value : op.getResults()) {
+         if (value.getType().isa<hw::ArrayType>()) {
+           op.emitError("unsupported packed array expression");
++          signalPassFailure();
+         }
+       }
+     }
+diff --git a/lib/Dialect/SV/Transforms/PrettifyVerilog.cpp b/lib/Dialect/SV/Transforms/PrettifyVerilog.cpp
+index 53b9f55b0..e6a73c664 100644
+--- a/lib/Dialect/SV/Transforms/PrettifyVerilog.cpp
++++ b/lib/Dialect/SV/Transforms/PrettifyVerilog.cpp
+@@ -22,6 +22,7 @@
+ #include "circt/Dialect/Comb/CombOps.h"
+ #include "circt/Dialect/HW/HWOps.h"
+ #include "circt/Dialect/SV/SVPasses.h"
++#include "circt/Support/LoweringOptions.h"
+ #include "mlir/IR/ImplicitLocOpBuilder.h"
+ #include "mlir/IR/Matchers.h"
+ #include "llvm/ADT/TypeSwitch.h"
+@@ -51,6 +52,7 @@ private:
+   bool splitAssignment(OpBuilder &builder, Value dst, Value src);
+ 
+   bool anythingChanged;
++  LoweringOptions options;
+ 
+   DenseSet<Operation *> toDelete;
+ };
+@@ -337,6 +339,9 @@ bool PrettifyVerilogPass::prettifyUnaryOperator(Operation *op) {
+   for (auto *user : op->getUsers()) {
+     if (isa<comb::ExtractOp, hw::ArraySliceOp>(user))
+       return false;
++    if (!options.allowExprInEventControl &&
++        isa<sv::AlwaysFFOp, sv::AlwaysOp>(user))
++      return false;
+   }
+ 
+   // Duplicating unary operations can move them across blocks (down the region
+@@ -531,6 +536,7 @@ void PrettifyVerilogPass::processPostOrder(Block &body) {
+ 
+ void PrettifyVerilogPass::runOnOperation() {
+   hw::HWModuleOp thisModule = getOperation();
++  options = LoweringOptions(thisModule->getParentOfType<mlir::ModuleOp>());
+ 
+   // Keeps track if anything changed during this pass, used to determine if
+   // the analyses were preserved.
+diff --git a/test/Conversion/ExportVerilog/sv-always-wire.mlir b/test/Conversion/ExportVerilog/sv-always-wire.mlir
+index ecbcc43c5..671b39fe3 100644
+--- a/test/Conversion/ExportVerilog/sv-always-wire.mlir
++++ b/test/Conversion/ExportVerilog/sv-always-wire.mlir
+@@ -1,4 +1,5 @@
+-// RUN: circt-opt %s --export-verilog --verify-diagnostics -o %t | FileCheck %s --strict-whitespace
++// RUN: circt-opt %s -prettify-verilog --export-verilog --verify-diagnostics -o %t | FileCheck %s --strict-whitespace
++// RUN: circt-opt %s -test-apply-lowering-options='options=exprInEventControl' -prettify-verilog -export-verilog | FileCheck %s --check-prefix=INLINE
+ 
+ // CHECK-LABEL: module AlwaysSpill(
+ hw.module @AlwaysSpill(%port: i1) {
+@@ -23,17 +24,33 @@ hw.module @AlwaysSpill(%port: i1) {
+ 
+   // Constant values should cause a spill.
+   // CHECK: always @(posedge [[TMP1]])
++  // INLINE: always @(posedge 1'h0)
+   sv.always posedge %false {}
+   // CHECK: always_ff @(posedge [[TMP2]])
++  // INLINE: always_ff @(posedge 1'h1)
+   sv.alwaysff(posedge %true) {}
+ }
+ 
+ // CHECK-LABEL: module Foo
+-hw.module @Foo(%clock: i1, %reset0: i1, %reset1: i1) -> () {
++// INLINE-LABEL: module Foo
++hw.module @Foo(%reset0: i1, %reset1: i1) -> () {
+   %0 = comb.or %reset0, %reset1 : i1
+-// CHECK-NOT: _GEN_0
++  // CHECK:      wire [[TMP0:.*]] = reset0 | reset1;
++  // CHECK-NEXT: always @(posedge [[TMP0]])
++  // CHECK-NEXT:   if ([[TMP0]])
+   sv.always posedge %0 {
+     sv.if %0 {
+     }
+   }
++  %true = hw.constant true
++  %1 = comb.xor %reset0, %true : i1
++  // CHECK:      wire [[TMP1:.*]] = ~reset0;
++  // CHECK-NEXT: always @(posedge [[TMP1]])
++  // CHECK-NEXT:   if ([[TMP1]])
++  // INLINE:     always @(posedge ~reset0)
++  // INLINE-NEXT:   if (~reset0)
++  sv.always posedge %1 {
++    sv.if %1 {
++    }
++  }
+ }
+diff --git a/test/Conversion/ExportVerilog/sv-dialect.mlir b/test/Conversion/ExportVerilog/sv-dialect.mlir
+index 04f40b36a..16a42c675 100644
+--- a/test/Conversion/ExportVerilog/sv-dialect.mlir
++++ b/test/Conversion/ExportVerilog/sv-dialect.mlir
+@@ -1,4 +1,4 @@
+-// RUN: circt-opt %s -test-apply-lowering-options='options=exprInEventControl,explicitBitcast,maximumNumberOfTermsPerExpression=10' -export-verilog -verify-diagnostics | FileCheck %s
++// RUN: circt-opt %s -test-apply-lowering-options='options=explicitBitcast,maximumNumberOfTermsPerExpression=10' -export-verilog -verify-diagnostics | FileCheck %s
+ 
+ // CHECK-LABEL: module M1
+ // CHECK-NEXT:    #(parameter [41:0] param1) (
+diff --git a/test/Dialect/SV/hw-legalize-modules-packed-arrays.mlir b/test/Dialect/SV/hw-legalize-modules-packed-arrays.mlir
+index b1030bb25..682d2c702 100644
+--- a/test/Dialect/SV/hw-legalize-modules-packed-arrays.mlir
++++ b/test/Dialect/SV/hw-legalize-modules-packed-arrays.mlir
+@@ -1,8 +1,6 @@
+-// RUN: circt-opt -hw-legalize-modules -verify-diagnostics %s | FileCheck %s
++// RUN: circt-opt -split-input-file -hw-legalize-modules -verify-diagnostics %s | FileCheck %s
+ 
+ module attributes {circt.loweringOptions = "disallowPackedArrays"} {
+-
+-// CHECK-LABEL: hw.module @reject_arrays
+ hw.module @reject_arrays(%arg0: i8, %arg1: i8, %arg2: i8,
+                          %arg3: i8, %sel: i2, %clock: i1)
+    -> (a: !hw.array<4xi8>) {
+@@ -19,7 +17,10 @@ hw.module @reject_arrays(%arg0: i8, %arg1: i8, %arg2: i8,
+   %1 = sv.read_inout %reg : !hw.inout<array<4xi8>>
+   hw.output %1 : !hw.array<4xi8>
+ }
++}
+ 
++// -----
++module attributes {circt.loweringOptions = "disallowPackedArrays"} {
+ // CHECK-LABEL: hw.module @array_create_get_comb
+ hw.module @array_create_get_comb(%arg0: i8, %arg1: i8, %arg2: i8, %arg3: i8,
+                                  %sel: i2)
+@@ -83,4 +84,31 @@ hw.module @array_create_get_default(%arg0: i8, %arg1: i8, %arg2: i8, %arg3: i8,
+   }
+ }
+ 
++// CHECK-LABEL: hw.module @array_constant_get_comb
++hw.module @array_constant_get_comb(%sel: i2)
++   -> (a: i8) {
++  // CHECK: %casez_tmp = sv.reg  : !hw.inout<i8>
++  // CHECK: sv.alwayscomb  {
++  // CHECK:   sv.case casez %sel : i2
++  // CHECK:   case b00: {
++  // CHECK:     sv.bpassign %casez_tmp, %c3_i8 : i8
++  // CHECK:   }
++  // CHECK:   case b01: {
++  // CHECK:     sv.bpassign %casez_tmp, %c2_i8 : i8
++  // CHECK:   }
++  // CHECK:   case b10: {
++  // CHECK:     sv.bpassign %casez_tmp, %c1_i8 : i8
++  // CHECK:   }
++  // CHECK:   default: {
++  // CHECK:     sv.bpassign %casez_tmp, %c0_i8 : i8
++  // CHECK:   }
++  // CHECK: }
++  %0 = hw.aggregate_constant [0 : i8, 1 : i8, 2 : i8, 3 : i8] : !hw.array<4xi8>
++  // CHECK: %0 = sv.read_inout %casez_tmp : !hw.inout<i8>
++  %1 = hw.array_get %0[%sel] : !hw.array<4xi8>, i2
++
++  // CHECK: hw.output %0 : i8
++  hw.output %1 : i8
++}
++
+ }  // end builtin.module
