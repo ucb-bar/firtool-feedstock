@@ -1,6 +1,6 @@
 {% set name = "firtool" %}
-{% set version = "1.30.0" %}
-{% set tag = "firtool-1.30.0" %}
+{% set version = "1.58.0" %}
+{% set tag = "firtool-1.58.0" %}
 {% set build_number = environ.get('GIT_DESCRIBE_NUMBER', '0') %}
 
 package:
